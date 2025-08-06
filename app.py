@@ -3,8 +3,6 @@
 from gevent import monkey
 monkey.patch_all()
 
-
-
 import os
 import json
 import time
@@ -12,12 +10,16 @@ import requests
 import logging
 import secrets
 import re
+import base64
 from flask import Flask, request, render_template, jsonify, abort, redirect, url_for, session, flash
 from flask_socketio import SocketIO, emit, disconnect
 from datetime import datetime, timedelta
 from functools import wraps
 from werkzeug.security import generate_password_hash, check_password_hash
 import redis
+from cryptography.fernet import Fernet
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 
 # at the very top of app.py
 heartbeat_started = False
@@ -29,21 +31,203 @@ def spawn_heartbeat_once():
         socketio.start_background_task(target=start_heartbeat_check)
         heartbeat_started = True
 
+# ============================================================================
+# ENCRYPTION SYSTEM FOR REDIS DATA
+# ============================================================================
 
+class RedisEncryption:
+    """Handles encryption/decryption of sensitive data stored in Redis"""
+    
+    def __init__(self):
+        self.fernet = None
+        self._initialize_encryption()
+    
+    def _initialize_encryption(self):
+        """Initialize encryption with key derived from environment variables"""
+        # Get encryption password from environment (REQUIRED for production)
+        encryption_password = os.environ.get("REDIS_ENCRYPTION_KEY")
+        
+        if not encryption_password:
+            # For development only - generate a temporary key
+            app.logger.warning("⚠️  REDIS_ENCRYPTION_KEY not set! Using temporary key for development.")
+            app.logger.warning("⚠️  SET REDIS_ENCRYPTION_KEY environment variable for production!")
+            encryption_password = "DEV_TEMPORARY_KEY_NOT_FOR_PRODUCTION_USE_12345"
+        
+        # Derive a proper encryption key from the password
+        password_bytes = encryption_password.encode('utf-8')
+        salt = b'tradepro_redis_salt_2025'  # Fixed salt for consistency
+        
+        kdf = PBKDF2HMAC(
+            algorithm=hashes.SHA256(),
+            length=32,
+            salt=salt,
+            iterations=100000,
+        )
+        
+        key = base64.urlsafe_b64encode(kdf.derive(password_bytes))
+        self.fernet = Fernet(key)
+        
+        app.logger.info("✅ Redis encryption initialized successfully")
+    
+    def encrypt_data(self, data):
+        """Encrypt data for Redis storage"""
+        try:
+            if isinstance(data, dict):
+                data = json.dumps(data)
+            elif not isinstance(data, str):
+                data = str(data)
+            
+            encrypted_bytes = self.fernet.encrypt(data.encode('utf-8'))
+            return base64.urlsafe_b64encode(encrypted_bytes).decode('utf-8')
+            
+        except Exception as e:
+            app.logger.error(f"Encryption error: {e}")
+            raise
+    
+    def decrypt_data(self, encrypted_data):
+        """Decrypt data from Redis storage"""
+        try:
+            encrypted_bytes = base64.urlsafe_b64decode(encrypted_data.encode('utf-8'))
+            decrypted_bytes = self.fernet.decrypt(encrypted_bytes)
+            return decrypted_bytes.decode('utf-8')
+            
+        except Exception as e:
+            app.logger.error(f"Decryption error: {e}")
+            raise
+
+# Initialize encryption system
+redis_encryption = None
 
 # pick up the Redis Cloud URL from Heroku config
 REDIS_URL = os.environ.get("REDISCLOUD_URL")
 redis_client = redis.from_url(REDIS_URL, decode_responses=True)
 
+# ============================================================================
+# ENCRYPTED REDIS STORAGE FUNCTIONS
+# ============================================================================
+
+def save_users():
+    """Save users database to Redis with encryption"""
+    try:
+        encrypted_data = {}
+        for username, user_data in users_db.items():
+            # Encrypt each user's data individually
+            encrypted_user_data = redis_encryption.encrypt_data(user_data)
+            encrypted_data[username] = encrypted_user_data
+        
+        # Store encrypted data in Redis
+        redis_client.delete("users_database_encrypted")  # Clear old data
+        if encrypted_data:
+            redis_client.hset("users_database_encrypted", mapping=encrypted_data)
+        
+        app.logger.info(f"✅ Saved {len(users_db)} encrypted users to Redis")
+        
+    except Exception as e:
+        app.logger.error(f"❌ Error saving encrypted users to Redis: {e}")
+        raise
+
+def load_users():
+    """Load and decrypt users database from Redis"""
+    try:
+        encrypted_data = redis_client.hgetall("users_database_encrypted")
+        
+        if not encrypted_data:
+            app.logger.info("No encrypted users found in Redis, starting with empty database")
+            return {}
+        
+        # Decrypt each user's data
+        decrypted_users = {}
+        for username, encrypted_user_data in encrypted_data.items():
+            try:
+                decrypted_json = redis_encryption.decrypt_data(encrypted_user_data)
+                user_data = json.loads(decrypted_json)
+                decrypted_users[username] = user_data
+            except Exception as e:
+                app.logger.error(f"❌ Failed to decrypt user data for {username}: {e}")
+                continue
+        
+        app.logger.info(f"✅ Loaded {len(decrypted_users)} encrypted users from Redis")
+        return decrypted_users
+        
+    except Exception as e:
+        app.logger.error(f"❌ Error loading encrypted users from Redis: {e}")
+        return {}
+
+def save_webhook_tokens():
+    """Save webhook tokens to Redis with encryption"""
+    try:
+        encrypted_data = {}
+        for token, token_data in webhook_tokens.items():
+            # Encrypt each token's metadata (but keep token itself as key)
+            encrypted_token_data = redis_encryption.encrypt_data(token_data)
+            encrypted_data[token] = encrypted_token_data
+        
+        # Store encrypted data in Redis
+        redis_client.delete("webhook_tokens_encrypted")  # Clear old data
+        if encrypted_data:
+            redis_client.hset("webhook_tokens_encrypted", mapping=encrypted_data)
+        
+        app.logger.info(f"✅ Saved {len(webhook_tokens)} encrypted webhook tokens to Redis")
+        
+    except Exception as e:
+        app.logger.error(f"❌ Error saving encrypted webhook tokens to Redis: {e}")
+        raise
+
+def load_webhook_tokens():
+    """Load and decrypt webhook tokens from Redis"""
+    try:
+        encrypted_data = redis_client.hgetall("webhook_tokens_encrypted")
+        
+        if not encrypted_data:
+            app.logger.info("No encrypted webhook tokens found in Redis, starting with empty database")
+            return {}
+        
+        # Decrypt each token's metadata
+        decrypted_tokens = {}
+        for token, encrypted_token_data in encrypted_data.items():
+            try:
+                decrypted_json = redis_encryption.decrypt_data(encrypted_token_data)
+                token_data = json.loads(decrypted_json)
+                decrypted_tokens[token] = token_data
+            except Exception as e:
+                app.logger.error(f"❌ Failed to decrypt webhook token data for {token}: {e}")
+                continue
+        
+        app.logger.info(f"✅ Loaded {len(decrypted_tokens)} encrypted webhook tokens from Redis")
+        return decrypted_tokens
+        
+    except Exception as e:
+        app.logger.error(f"❌ Error loading encrypted webhook tokens from Redis: {e}")
+        return {}
+
 def save_params(params: dict):
-    """Save the last-connection params into Redis as a hash."""
-    redis_client.hset("last_connection_params", mapping=params)
+    """Save the last-connection params into Redis with encryption"""
+    try:
+        encrypted_params = redis_encryption.encrypt_data(params)
+        redis_client.set("last_connection_params_encrypted", encrypted_params)
+        app.logger.info("✅ Saved encrypted connection params to Redis")
+    except Exception as e:
+        app.logger.error(f"❌ Error saving encrypted connection params: {e}")
 
 def load_params() -> dict:
-    """Load connection params from Redis. Returns {} if none."""
-    data = redis_client.hgetall("last_connection_params")
-    return data or {}
+    """Load and decrypt connection params from Redis. Returns {} if none."""
+    try:
+        encrypted_data = redis_client.get("last_connection_params_encrypted")
+        if not encrypted_data:
+            return {}
+        
+        decrypted_json = redis_encryption.decrypt_data(encrypted_data)
+        params = json.loads(decrypted_json)
+        app.logger.info("✅ Loaded encrypted connection params from Redis")
+        return params
+        
+    except Exception as e:
+        app.logger.error(f"❌ Error loading encrypted connection params: {e}")
+        return {}
 
+# ============================================================================
+# FLASK APPLICATION SETUP
+# ============================================================================
 
 # Configure enhanced logging
 logging.basicConfig(
@@ -54,8 +238,6 @@ logging.basicConfig(
 app = Flask(__name__)
 # Use environment variable for secret key with a fallback
 app.config['SECRET_KEY'] = os.environ.get("SECRET_KEY", secrets.token_hex(32))
-# No session timeout for 24/7 operation
-# app.config['PERMANENT_SESSION_LIFETIME'] = timedelta(minutes=30)  # Removed session expiration
 
 # Improved SocketIO configuration with reconnection settings
 socketio = SocketIO(
@@ -77,8 +259,6 @@ CONNECTOR_API_KEY = os.environ.get("CONNECTOR_API_KEY")
 DEFAULT_TIMEOUT = int(os.environ.get("DEFAULT_TIMEOUT", 60))
 # Max consecutive heartbeat failures before considering disconnected
 MAX_HEARTBEAT_FAILURES = int(os.environ.get("MAX_HEARTBEAT_FAILURES", 3))
-# Store the last connection parameters for potential auto-reconnect
-# last_connection_params = {}
 
 # Global state tracking with separated concerns
 connection_state = {
@@ -96,12 +276,8 @@ socket_state = {
     "clients": set()                # Set of connected socket client IDs
 }
 
-# User database (replace with a real database in production)
-# In production, use a proper database like PostgreSQL, MySQL, or MongoDB
+# User database and webhook tokens (will be loaded from encrypted Redis)
 users_db = {}
-
-# Webhook URL paths with their tokens
-# Format: {"webhook_token": {"name": "Name", "created_at": "timestamp", "created_by": "username"}}
 webhook_tokens = {}
 
 # Helper function for custom domain webhook URLs
@@ -119,41 +295,46 @@ def login_required(f):
     def decorated_function(*args, **kwargs):
         if 'user_id' not in session:
             return redirect(url_for('login', next=request.url))
-        # No session expiration check for 24/7 operation
         return f(*args, **kwargs)
     return decorated_function
 
-# Initialize admin user from environment variables
+# Initialize admin user and load encrypted data from Redis
 @app.before_first_request
 def initialize_admin_user():
+    global users_db, webhook_tokens, redis_encryption
+    
+    # Initialize encryption system first
+    redis_encryption = RedisEncryption()
+    
+    # Load existing encrypted data from Redis FIRST
+    users_db = load_users()
+    webhook_tokens = load_webhook_tokens()
+    
+    # Only create admin user if it doesn't exist in Redis
     admin_username = os.environ.get("ADMIN_USERNAME")
     admin_password = os.environ.get("ADMIN_PASSWORD")
     
     if admin_username and admin_password and admin_username not in users_db:
-        app.logger.info(f"Initializing admin user: {admin_username}")
+        app.logger.info(f"Creating new admin user: {admin_username}")
         users_db[admin_username] = {
             "password_hash": generate_password_hash(admin_password),
             "is_admin": True,
             "created_at": datetime.now().isoformat()
         }
+        save_users()  # Save encrypted to Redis
+    else:
+        app.logger.info(f"Admin user already exists or not configured")
     
-    # Initialize a default webhook token from environment
-    default_webhook_token = os.environ.get("DEFAULT_WEBHOOK_TOKEN")
-    if default_webhook_token:
-        app.logger.info("Initializing default webhook token")
-        webhook_tokens[default_webhook_token] = {
-            "name": "Default Token",
-            "created_at": datetime.now().isoformat(),
-            "created_by": "system"
-        }
-        
-    # START HEARTBEAT LOOP ONCE AT FIRST REQUEST
-    # app.logger.info("Spawning heartbeat background task")
-    # socketio.start_background_task(target=start_heartbeat_check)
-
+    # DO NOT create default webhook token (Option 2/3 implementation)
+    # Customer will create their own tokens
+    
+    # Start heartbeat once
     spawn_heartbeat_once()
 
-# User management routes
+# ============================================================================
+# USER MANAGEMENT ROUTES
+# ============================================================================
+
 @app.route('/login', methods=['GET', 'POST'])
 def login():
     # If already logged in, redirect to index
@@ -211,6 +392,7 @@ def change_password():
             # Update password
             users_db[username]['password_hash'] = generate_password_hash(new_password)
             users_db[username]['password_updated_at'] = datetime.now().isoformat()
+            save_users()  # Save encrypted to Redis
             success = "Password changed successfully"
             app.logger.info(f"Password changed for user: {username}")
     
@@ -252,6 +434,7 @@ def add_user():
                 "created_at": datetime.now().isoformat(),
                 "created_by": session['user_id']
             }
+            save_users()  # Save encrypted to Redis
             success = f"User '{username}' created successfully"
             app.logger.info(f"New user created: {username} by {session['user_id']}")
     
@@ -268,6 +451,7 @@ def delete_user(username):
         flash('You cannot delete your own account.', 'danger')
     elif username in users_db:
         del users_db[username]
+        save_users()  # Save encrypted to Redis
         flash(f"User '{username}' deleted successfully.", 'success')
         app.logger.info(f"User deleted: {username} by {session['user_id']}")
     else:
@@ -275,7 +459,10 @@ def delete_user(username):
     
     return redirect(url_for('admin_users'))
 
-# Webhook token management
+# ============================================================================
+# WEBHOOK TOKEN MANAGEMENT
+# ============================================================================
+
 @app.route('/admin/webhook_tokens', methods=['GET'])
 @login_required
 def admin_webhook_tokens():
@@ -316,6 +503,7 @@ def generate_webhook_token():
                 "created_at": datetime.now().isoformat(),
                 "created_by": session['user_id']
             }
+            save_webhook_tokens()  # Save encrypted to Redis
             webhook_url = get_webhook_base_url() + f"/webhook/{new_token}"
             success = "Webhook token created successfully"
             app.logger.info(f"New webhook token created: {token_name} by {session['user_id']}")
@@ -332,6 +520,7 @@ def delete_webhook_token(token):
     if token in webhook_tokens:
         token_name = webhook_tokens[token]['name']
         del webhook_tokens[token]
+        save_webhook_tokens()  # Save encrypted to Redis
         flash(f"Webhook token '{token_name}' deleted successfully.", 'success')
         app.logger.info(f"Webhook token deleted: {token_name} by {session['user_id']}")
     else:
@@ -339,7 +528,10 @@ def delete_webhook_token(token):
     
     return redirect(url_for('admin_webhook_tokens'))
 
-# Route for index page now requires login
+# ============================================================================
+# MAIN APPLICATION ROUTES
+# ============================================================================
+
 @app.route('/')
 @login_required
 def index():
@@ -349,8 +541,6 @@ def index():
     
     app.logger.info(f"Serving index page. Webhook URL: {webhook_url}")
     return render_template('index.html', webhook_url=webhook_url, username=session.get('user_id', 'User'))
-
-# The functions below are from the original code with webhook modifications
 
 def send_backend_request(endpoint, method="POST", json_data=None, form_data=None, timeout=None):
     """Centralized function to handle backend requests with proper error handling"""
@@ -365,16 +555,6 @@ def send_backend_request(endpoint, method="POST", json_data=None, form_data=None
     app.logger.info(f"Sending {method} request to backend: {url}")
     
     try:
-        # if method.upper() == "POST":
-        #    if json_data:
-        #        response = requests.post(url, json=json_data, headers=headers, timeout=timeout)
-        #    elif form_data:
-        #        response = requests.post(url, data=form_data, headers=headers, timeout=timeout)
-        #    else:
-        #        response = requests.post(url, headers=headers, timeout=timeout)
-        #else:
-        #    response = requests.get(url, headers=headers, timeout=timeout)
-
         if method.upper() == "POST":
             if json_data is not None:
                 response = requests.post(url, json=json_data, headers=headers, timeout=timeout)
@@ -411,7 +591,7 @@ def send_backend_request(endpoint, method="POST", json_data=None, form_data=None
 def connect_route():
     app.logger.info("Received request on /connect route")
 
-    # 1) Read the HTML form
+    # Read the HTML form
     data = request.form
     payload = {
         "ip":           data.get("ip"),
@@ -419,7 +599,7 @@ def connect_route():
         "account_type": data.get("account_type")
     }
 
-    # 2) Reject if any field is missing
+    # Reject if any field is missing
     missing_fields = [f for f, v in payload.items() if not v]
     if missing_fields:
         error_msg = f"Missing required fields: {', '.join(missing_fields)}"
@@ -431,7 +611,7 @@ def connect_route():
         })
         return jsonify({"success": False, "message": error_msg}), 400
 
-    # 3) Forward to your IBKR-connector as JSON
+    # Forward to IBKR-connector as JSON
     result, error = send_backend_request("connect", json_data=payload)
     if error:
         app.logger.error(f"IBKR connector rejected /connect: {error['error']}")
@@ -442,48 +622,17 @@ def connect_route():
         })
         return jsonify({"success": False, "message": error["error"]}), error["status_code"]
 
-    # 4) Only *after* the connector has accepted it do we stash for auto-reconnect
-    # global last_connection_params
-    # last_connection_params = payload.copy()
-    # app.logger.info(f"Storing connection params for auto-reconnect: {last_connection_params!r}")
-    # 4) Persist to Redis so all dynos/workers can reuse
+    # Persist encrypted connection params to Redis for auto-reconnect
     save_params(payload)
-    app.logger.info(f"Saved connection params to Redis: {payload!r}")
+    app.logger.info(f"Saved encrypted connection params to Redis: {payload!r}")
 
-
-
-
-
-
-    # 5) Tell the front-end it worked
+    # Tell the front-end it worked
     socketio.emit('connection_status', {
         "success": True,
         "message": result.get("message", "Connected successfully."),
         "socket_connected": socket_state["connected"]
     })
     return jsonify(result), 200
-
-    
-    # If successful, update connection state and start heartbeat
-    if result and result.get('success'):
-        connection_state["ibkr_connected"] = True
-        connection_state["last_ibkr_status"] = True
-        connection_state["last_backend_heartbeat"] = datetime.now()
-        connection_state["heartbeat_failures"] = 0
-        connection_state["reconnect_in_progress"] = False
-        
-        # Add socket_connected to the status
-        result["socket_connected"] = socket_state["connected"]
-        socketio.emit('connection_status', result)
-        
-        # Start the enhanced heartbeat check if not already running
-        socketio.start_background_task(target=start_heartbeat_check)
-    else:
-        # Add socket_connected to the status
-        result["socket_connected"] = socket_state["connected"]
-        socketio.emit('connection_status', result)
-    
-    return jsonify(result)
 
 @app.route('/disconnect', methods=['POST'])
 @login_required
@@ -559,7 +708,6 @@ def webhook_receiver(token):
     
     return "Webhook received and processed successfully", 200
 
-# Add catch-all route for old webhook URL
 @app.route('/webhook', methods=['POST'])
 def webhook_legacy():
     app.logger.warning("Received request to deprecated webhook URL without token")
@@ -650,6 +798,37 @@ def heartbeat():
             "connected_to_ibkr": connection_state["ibkr_connected"],
             "error": str(e)
         })
+
+# Add new monitoring endpoint for UptimeRobot
+@app.route('/monitor', methods=['GET'])
+def monitor():
+    """Dedicated endpoint for external monitoring services"""
+    try:
+        # Check IBKR connection status
+        ibkr_connected = connection_state["ibkr_connected"]
+        
+        # Return HTTP error when IBKR disconnected
+        if not ibkr_connected:
+            return jsonify({
+                "status": "ibkr_disconnected",
+                "timestamp": datetime.now().isoformat()
+            }), 503  # HTTP error for UptimeRobot
+        
+        # Return HTTP 200 when IBKR connected
+        return jsonify({
+            "status": "monitoring_ok",
+            "timestamp": datetime.now().isoformat()
+        })
+        
+    except Exception as e:
+        return jsonify({
+            "status": "error",
+            "error": str(e)
+        }), 500
+
+# ============================================================================
+# HEARTBEAT AND RECONNECTION SYSTEM
+# ============================================================================
 
 def heartbeat_check():
     """Enhanced background task to periodically check backend connectivity with focus on IBKR status"""
@@ -755,14 +934,11 @@ def verify_and_reconnect():
         
         if not backend_error:
             # Backend is responding, try to check actual connection status
-            # verify_result, verify_error = send_backend_request("heatbeat", timeout=10)
-
             verify_result, verify_error = send_backend_request(
                 "heartbeat",
                 method="GET",
                 timeout=10
             )
-
             
             if not verify_error and verify_result:
                 # Get the actual IBKR connection status
@@ -808,9 +984,7 @@ def verify_and_reconnect():
             connection_state["reconnect_in_progress"] = False
 
 def try_reconnect():
-    """Attempt to reconnect to backend using stored connection parameters"""
-    # global last_connection_params
-    
+    """Attempt to reconnect to backend using stored encrypted connection parameters"""
     if not connection_state["reconnect_in_progress"]:
         connection_state["reconnect_in_progress"] = True
     
@@ -821,21 +995,7 @@ def try_reconnect():
         "socket_connected": socket_state["connected"]
     })
     
-    # Check if we have connection params
-    # if not last_connection_params or not all(last_connection_params.values()):
-    #    app.logger.warning("No stored connection parameters available for auto-reconnect")
-    #    connection_state["reconnect_in_progress"] = False
-    #    socketio.emit('connection_status', {
-    #        "success": connection_state["ibkr_connected"],
-    #        "message": "Cannot auto-reconnect: No stored connection parameters",
-    #        "reconnecting": False,
-    #        "socket_connected": socket_state["connected"]
-    #    })
-    #   return
-    # if not last_connection_params or not all(last_connection_params.values()):
-    #    app.logger.warning("Cannot auto-reconnect: no stored connection parameters")
-
-    # Load the params we saved earlier
+    # Load the encrypted params we saved earlier
     params = load_params()
     if not params:
         app.logger.warning("Cannot auto-reconnect: no stored connection parameters in Redis")
@@ -848,15 +1008,7 @@ def try_reconnect():
         })
         return
 
-   
     # Attempt to reconnect using the stored parameters
-    # app.logger.info(f"Attempting automatic reconnect with stored parameters: {json.dumps(last_connection_params)}")
-    # result, error = send_backend_request("connect", json_data=last_connection_params)
-    # result, error = send_backend_request(
-    #    "connect",
-    #    method="POST",
-    #    json_data=last_connection_params
-    # )
     app.logger.info(f"Attempting automatic reconnect with stored parameters: {params!r}")
     result, error = send_backend_request(
         "connect",
@@ -864,7 +1016,6 @@ def try_reconnect():
         json_data=params
     )
 
-   
     if error:
         app.logger.error(f"Auto-reconnect failed: {error['error']}")
         connection_state["reconnect_in_progress"] = False
@@ -899,7 +1050,10 @@ def try_reconnect():
             "details": result
         })
 
-# Socket.IO event handlers
+# ============================================================================
+# SOCKET.IO EVENT HANDLERS
+# ============================================================================
+
 @socketio.on('connect')
 def socket_connect():
     app.logger.info(f"Socket.IO client connected: {request.sid}")
@@ -914,15 +1068,6 @@ def socket_connect():
     socket_state["connected"] = True
     socket_state["last_connected"] = datetime.now()
     socket_state["clients"].add(request.sid)
-    
-    # Send initial connection state to newly connected clients: Skipping initial emit here to avoid sending stale "Not Connected"
-    # emit('connection_status', {
-    #    "success": connection_state["ibkr_connected"],
-    #    "message": "Connected to IBKR" if connection_state["ibkr_connected"] else "Not Connected",
-    #    "reconnect_in_progress": connection_state["reconnect_in_progress"],
-    #    "heartbeat_failures": connection_state["heartbeat_failures"],
-    #    "socket_connected": True
-    # })
 
 @socketio.on('disconnect')
 def socket_disconnect():
@@ -934,8 +1079,6 @@ def socket_disconnect():
     # Update socket state
     if len(socket_state["clients"]) == 0:
         socket_state["connected"] = False
-    
-    # Note: We do NOT change the IBKR connection status here
 
 @socketio.on('force_reconnect')
 def force_reconnect():
@@ -966,6 +1109,10 @@ def force_reconnect():
 @socketio.on_error()
 def error_handler(e):
     app.logger.error(f"Socket.IO error: {str(e)}")
+
+# ============================================================================
+# ADDITIONAL UTILITY ROUTES
+# ============================================================================
 
 @app.route('/backend_heartbeat', methods=['GET'])
 def backend_heartbeat():
@@ -1001,25 +1148,66 @@ def reset_heartbeat_failures():
         "heartbeat_failures": connection_state["heartbeat_failures"]
     })
 
-# Add new monitoring endpoint for UptimeRobot (optional - if you want to use the HTTP error approach)
-@app.route('/monitor', methods=['GET'])
-def monitor():
-    """Dedicated endpoint for external monitoring services"""
+# ============================================================================
+# ADMIN UTILITIES FOR ENCRYPTED DATA MANAGEMENT
+# ============================================================================
+
+@app.route('/admin/clear_encrypted_data', methods=['POST'])
+@login_required
+def clear_encrypted_data():
+    """Clear all encrypted data from Redis (admin only, for testing)"""
+    if not session.get('is_admin', False):
+        flash('You do not have permission to perform this action.', 'danger')
+        return redirect(url_for('index'))
+    
     try:
-        # Check IBKR connection status
-        ibkr_connected = connection_state["ibkr_connected"]
+        # Clear encrypted data from Redis
+        redis_client.delete(
+            "users_database_encrypted", 
+            "webhook_tokens_encrypted", 
+            "last_connection_params_encrypted"
+        )
         
-        # Return HTTP error when IBKR disconnected
-        if not ibkr_connected:
-            return jsonify({
-                "status": "ibkr_disconnected",
-                "timestamp": datetime.now().isoformat()
-            }), 503  # HTTP error for UptimeRobot
+        # Clear in-memory data
+        global users_db, webhook_tokens
+        users_db = {}
+        webhook_tokens = {}
         
-        # Return HTTP 200 when IBKR connected
+        flash("All encrypted Redis data cleared successfully.", 'success')
+        app.logger.info(f"Encrypted Redis data cleared by {session['user_id']}")
+        
+    except Exception as e:
+        flash(f"Error clearing encrypted Redis data: {e}", 'danger')
+        app.logger.error(f"Error clearing encrypted Redis data: {e}")
+    
+    return redirect(url_for('admin_users'))
+
+@app.route('/admin/encryption_status', methods=['GET'])
+@login_required
+def encryption_status():
+    """Show encryption status and Redis data info (admin only)"""
+    if not session.get('is_admin', False):
+        flash('You do not have permission to access this page.', 'danger')
+        return redirect(url_for('index'))
+    
+    try:
+        # Check what's in Redis
+        redis_info = {
+            "encrypted_users": len(redis_client.hgetall("users_database_encrypted")),
+            "encrypted_tokens": len(redis_client.hgetall("webhook_tokens_encrypted")),
+            "encrypted_params": bool(redis_client.get("last_connection_params_encrypted")),
+            "encryption_initialized": redis_encryption is not None,
+            "redis_connected": redis_client.ping()
+        }
+        
         return jsonify({
-            "status": "monitoring_ok",
-            "timestamp": datetime.now().isoformat()
+            "status": "success",
+            "encryption_status": "✅ Active",
+            "redis_info": redis_info,
+            "memory_data": {
+                "users_loaded": len(users_db),
+                "tokens_loaded": len(webhook_tokens)
+            }
         })
         
     except Exception as e:
@@ -1028,8 +1216,13 @@ def monitor():
             "error": str(e)
         }), 500
 
+# ============================================================================
+# APPLICATION STARTUP
+# ============================================================================
+
 if __name__ == '__main__':
     port = int(os.environ.get("PORT", 5000))
     use_debug = os.environ.get("FLASK_DEBUG", "False").lower() == "true"
-    app.logger.info(f"Starting Frontend Flask app on 0.0.0.0:{port} (Debug Mode: {use_debug})")
+    app.logger.info(f"🚀 Starting Frontend Flask app on 0.0.0.0:{port} (Debug Mode: {use_debug})")
+    app.logger.info("🔒 Redis encryption enabled for sensitive data storage")
     socketio.run(app, host="0.0.0.0", port=port, debug=use_debug)
