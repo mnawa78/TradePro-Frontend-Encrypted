@@ -9,3 +9,4 @@ dnspython==2.0.0
 gevent==22.10.2
 gevent-websocket==0.10.1
 redis>=4.5.0
+cryptography>=41.0.0
