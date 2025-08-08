@@ -1216,6 +1216,110 @@ def encryption_status():
             "error": str(e)
         }), 500
 
+
+# ============================================================================
+# SELF-SERVICE PASSWORD RESET SYSTEM (No Email Required)
+# ============================================================================
+
+import secrets
+from datetime import datetime, timedelta
+
+# Temporary storage for reset tokens
+password_reset_tokens = {}
+
+@app.route('/forgot_password', methods=['GET', 'POST'])
+def forgot_password():
+    """Public password reset - Step 1: Request reset (NO LOGIN REQUIRED)"""
+    if request.method == 'POST':
+        username = request.form.get('username')
+        
+        if not username:
+            flash('Username is required.', 'danger')
+            return render_template('forgot_password.html')
+            
+        if username not in users_db:
+            # Don't reveal if username exists (security)
+            flash('If this username exists, a reset link has been generated.', 'info')
+            return render_template('forgot_password.html')
+        
+        # Generate secure reset token
+        reset_token = secrets.token_urlsafe(32)
+        password_reset_tokens[reset_token] = {
+            'username': username,
+            'expires_at': datetime.now() + timedelta(hours=1),  # 1 hour expiration
+            'used': False
+        }
+        
+        # Create reset link
+        reset_link = request.host_url.rstrip('/') + f"/reset_password/{reset_token}"
+        
+        app.logger.info(f"Password reset requested for user: {username}")
+        
+        return render_template('forgot_password.html', reset_link=reset_link, show_link=True)
+    
+    return render_template('forgot_password.html')
+
+@app.route('/reset_password/<token>', methods=['GET', 'POST'])
+def reset_password(token):
+    """Public password reset - Step 2: Reset with token (NO LOGIN REQUIRED)"""
+    # Validate token
+    if token not in password_reset_tokens:
+        flash('Invalid or expired reset link.', 'danger')
+        return redirect(url_for('login'))
+    
+    token_data = password_reset_tokens[token]
+    
+    # Check if token is expired
+    if datetime.now() > token_data['expires_at']:
+        del password_reset_tokens[token]
+        flash('Reset link has expired. Please request a new one.', 'danger')
+        return redirect(url_for('forgot_password'))
+    
+    # Check if token was already used
+    if token_data['used']:
+        flash('This reset link has already been used.', 'danger')
+        return redirect(url_for('login'))
+    
+    if request.method == 'POST':
+        new_password = request.form.get('new_password')
+        confirm_password = request.form.get('confirm_password')
+        
+        # Validate passwords
+        if not new_password or not confirm_password:
+            flash('Both password fields are required.', 'danger')
+            return render_template('reset_password.html', token=token)
+        
+        if new_password != confirm_password:
+            flash('Passwords do not match.', 'danger')
+            return render_template('reset_password.html', token=token)
+        
+        if len(new_password) < 8:
+            flash('Password must be at least 8 characters long.', 'danger')
+            return render_template('reset_password.html', token=token)
+        
+        # Reset the password
+        username = token_data['username']
+        users_db[username]['password_hash'] = generate_password_hash(new_password)
+        users_db[username]['password_updated_at'] = datetime.now().isoformat()
+        users_db[username]['password_reset_at'] = datetime.now().isoformat()
+        
+        # Save to encrypted Redis
+        save_users()
+        
+        # Mark token as used
+        password_reset_tokens[token]['used'] = True
+        
+        app.logger.info(f"Password reset completed for user: {username}")
+        flash('Your password has been reset successfully! You can now log in with your new password.', 'success')
+        return redirect(url_for('login'))
+    
+    return render_template('reset_password.html', token=token, username=token_data['username'])
+
+
+
+
+
+
 # ============================================================================
 # APPLICATION STARTUP
 # ============================================================================
